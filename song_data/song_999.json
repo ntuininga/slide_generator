@@ -1,0 +1,20 @@
+{
+    "number": "999",
+    "title": "A song",
+    "verses": [
+        {
+            "verse": 1,
+            "text": "aljdf  al;kjdf  ;lakjdfj ureionbn a;nbpoe na;lkd pna nb"
+        },
+        {
+            "verse": 2,
+            "text": "alkdjf  alkdj lkajlkd  an falkj  nadf"
+        },
+        {
+            "verse": 3,
+            "text": "lakjdl f al;kjd  ajdl;k alk lanlk djf alkn djal;k flan ;ldkna fn"
+        }
+    ],
+    "refrain": null,
+    "copyright": []
+}

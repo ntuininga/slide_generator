@@ -3,9 +3,9 @@ from tkinter import ttk, messagebox
 from tkcalendar import DateEntry
 from logic.parse_bulletin import parse_bulletin
 from slide_generator import generate_powerpoint_slides
+from ui.song_editor_window import SongEditorWindow
 import os
 import json
-import platform
 
 BASE_DIR = os.path.dirname(os.path.dirname(__file__))
 SONG_DIR = os.path.join(BASE_DIR, "song_data")
@@ -290,12 +290,20 @@ class MainWindow:
         self.root = root
         self.root.title("Bulletin Viewer / Editor")
         self.root.minsize(650, 500)
-        self.bulletin_folder = bulletin_folder
-
+        # Cross-platform fit to content
+        import platform
         if platform.system() == "Windows":
             self.root.state("zoomed")
         else:
             self.root.attributes("-zoomed", True)
+        self.bulletin_folder = bulletin_folder
+
+        # Menu bar
+        menubar = tk.Menu(root)
+        root.config(menu=menubar)
+        edit_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Edit", menu=edit_menu)
+        edit_menu.add_command(label="Song Editor", command=self.open_song_editor)
 
         self.all_songs = load_all_songs()
 
@@ -327,8 +335,8 @@ class MainWindow:
             tk.Label(self.scroll_frame, text="No bulletin found for today").pack()
 
         # Fit window to content
-        # self.root.update_idletasks()
-        # self.root.geometry(f"{self.root.winfo_reqwidth()}x{self.root.winfo_reqheight()}")
+        self.root.update_idletasks()
+        self.root.geometry(f"{self.root.winfo_reqwidth()}x{self.root.winfo_reqheight()}")
 
     def _build_ui(self):
         services_row = tk.Frame(self.scroll_frame)
@@ -349,6 +357,22 @@ class MainWindow:
             font=("TkDefaultFont", 11, "bold"),
             padx=10, pady=6
         ).pack()
+
+    def open_song_editor(self):
+        editor = SongEditorWindow(self.root)
+        # Reload songs into all SongRows when the editor is closed
+        editor.win.bind("<Destroy>", lambda _: self._reload_songs())
+
+    def _reload_songs(self):
+        self.all_songs = load_all_songs()
+        # Push updated song list into every existing SongRow
+        for sf in self.service_frames.values():
+            for row in sf.song_rows:
+                row.all_songs = self.all_songs
+                # Re-resolve the currently displayed song in case it changed
+                if row.resolved_song:
+                    num = str(row.resolved_song.get("number", ""))
+                    row.resolved_song = self.all_songs.get(num, row.resolved_song)
 
     def save_all(self):
         updated_bulletin = {

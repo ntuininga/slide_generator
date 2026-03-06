@@ -1,281 +1,464 @@
 import tkinter as tk
-from tkinter import simpledialog, messagebox
+from tkinter import ttk, messagebox, simpledialog
 import json
-from logic.song_manager import SongManager
+import os
+
+BASE_DIR = os.path.dirname(os.path.dirname(__file__))
+SONG_DIR = os.path.join(BASE_DIR, "song_data")
+ALL_SONGS_PATH = os.path.join(SONG_DIR, "all_songs.json")
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def load_songs():
+    """Load all individual song_*.json files. Returns dict keyed by number."""
+    songs = {}
+    if not os.path.exists(SONG_DIR):
+        return songs
+    for fname in os.listdir(SONG_DIR):
+        if fname.startswith("song_") and fname.endswith(".json"):
+            path = os.path.join(SONG_DIR, fname)
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                num = str(data.get("number", ""))
+                if num:
+                    songs[num] = data
+            except Exception as e:
+                print(f"[WARNING] Could not load {fname}: {e}")
+    return songs
+
+
+def save_songs(songs):
+    """Save each song to its own file and regenerate all_songs.json."""
+    os.makedirs(SONG_DIR, exist_ok=True)
+
+    expected = set()
+    for num, song in songs.items():
+        fname = f"song_{num}.json"
+        path = os.path.join(SONG_DIR, fname)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(song, f, indent=4, ensure_ascii=False)
+        expected.add(fname)
+
+    # Remove files for deleted songs
+    for fname in os.listdir(SONG_DIR):
+        if fname.startswith("song_") and fname.endswith(".json"):
+            if fname not in expected:
+                os.remove(os.path.join(SONG_DIR, fname))
+
+    # Write combined index
+    with open(ALL_SONGS_PATH, "w", encoding="utf-8") as f:
+        json.dump(songs, f, indent=4, ensure_ascii=False)
+
+
+def sort_key(num_str):
+    digits  = ''.join(c for c in num_str if c.isdigit())
+    letters = ''.join(c for c in num_str if c.isalpha())
+    return (int(digits) if digits else 0, letters)
+
+
+# ---------------------------------------------------------------------------
+# Main window
+# ---------------------------------------------------------------------------
 
 class SongEditorWindow:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("Songs Editor")
-        self.root.geometry("950x650")
+    def __init__(self, parent):
+        self.win = tk.Toplevel(parent)
+        self.win.title("Song Editor")
+        self.win.minsize(900, 600)
+        import platform
+        if platform.system() == "Windows":
+            self.win.state("zoomed")
+        else:
+            self.win.attributes("-zoomed", True)
 
-        # Logic layer
-        self.manager = SongManager()
+        self.songs = load_songs()
+        self._dirty = False          # unsaved changes flag
+        self._current_num = None     # currently selected song number
+        self._current_verse_idx = None  # index into song["verses"]
 
-        # Current selected verse mapping
-        self.current_verse_map = []
+        self._build_ui()
+        self._populate_song_list()
 
-        self.setup_ui()
-        self.refresh_song_list()
+    # -----------------------------------------------------------------------
+    # UI construction
+    # -----------------------------------------------------------------------
 
-    # -----------------------------
-    # --- UI Setup ---------------
-    # -----------------------------
-    def setup_ui(self):
-        # --- Left frame ---
-        left_frame = tk.Frame(self.root)
-        left_frame.pack(side=tk.LEFT, fill=tk.Y, padx=5, pady=5)
+    def _build_ui(self):
+        # ── Top toolbar ────────────────────────────────────────────────────
+        toolbar = tk.Frame(self.win, bd=1, relief="raised", pady=3)
+        toolbar.pack(fill="x", side="top")
 
-        tk.Label(left_frame, text="Search:").pack(anchor="w")
-        self.search_var = tk.StringVar()
-        search_entry = tk.Entry(left_frame, textvariable=self.search_var)
-        search_entry.pack(fill=tk.X, pady=(0,5))
-        self.search_var.trace_add("write", lambda *args: self.refresh_song_list())
+        tk.Button(toolbar, text="＋ New Song",  command=self._new_song,   width=12).pack(side="left", padx=4)
+        tk.Button(toolbar, text="✕ Delete Song", command=self._delete_song, width=12).pack(side="left", padx=2)
+        tk.Button(toolbar, text="💾 Save All",  command=self._save_all,
+                  bg="#2e7d32", fg="white", width=12).pack(side="left", padx=10)
 
-        self.song_listbox = tk.Listbox(left_frame, width=35)
-        self.song_listbox.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-        self.song_listbox.bind("<<ListboxSelect>>", self.on_song_select)
+        self._status_var = tk.StringVar(value="")
+        tk.Label(toolbar, textvariable=self._status_var, fg="#555").pack(side="right", padx=10)
 
-        song_btn_frame = tk.Frame(left_frame)
-        song_btn_frame.pack(fill=tk.X)
-        tk.Button(song_btn_frame, text="Add Song", command=self.add_song).pack(side=tk.LEFT)
-        tk.Button(song_btn_frame, text="Delete Song", command=self.delete_song).pack(side=tk.LEFT)
-        tk.Button(song_btn_frame, text="Save", command=self.save_songs).pack(side=tk.LEFT)
+        # ── Main area: left list | right detail ────────────────────────────
+        pane = tk.PanedWindow(self.win, orient="horizontal", sashrelief="raised", sashwidth=5)
+        pane.pack(fill="both", expand=True)
 
-        # --- Right frame ---
-        right_frame = tk.Frame(self.root)
-        right_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
+        # ── LEFT: song list ─────────────────────────────────────────────────
+        left = tk.Frame(pane, width=380)
+        pane.add(left, minsize=300)
 
-        # Title
-        tk.Label(right_frame, text="Title:").pack(anchor="w")
-        self.title_var = tk.StringVar()
-        title_entry = tk.Entry(right_frame, textvariable=self.title_var)
-        title_entry.pack(fill=tk.X)
-        self.title_var.trace_add("write", lambda *args: self.update_title())
+        search_frame = tk.Frame(left)
+        search_frame.pack(fill="x", padx=6, pady=6)
+        tk.Label(search_frame, text="🔍").pack(side="left")
+        self._search_var = tk.StringVar()
+        self._search_var.trace_add("write", lambda *_: self._populate_song_list())
+        tk.Entry(search_frame, textvariable=self._search_var).pack(side="left", fill="x", expand=True)
 
-        # Refrain
-        tk.Label(right_frame, text="Refrain:").pack(anchor="w")
-        self.refrain_text = tk.Text(right_frame, height=3)
-        self.refrain_text.pack(fill=tk.X)
-        self.refrain_text.bind("<KeyRelease>", lambda e: self.update_refrain())
+        self._song_list = tk.Listbox(left, activestyle="dotbox", selectbackground="#1565c0",
+                                     selectforeground="white", font=("Courier", 10))
+        sb = tk.Scrollbar(left, command=self._song_list.yview)
+        self._song_list.config(yscrollcommand=sb.set)
+        self._song_list.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=(0, 6))
+        sb.pack(side="left", fill="y", pady=(0, 6))
+        self._song_list.bind("<<ListboxSelect>>", self._on_song_select)
+
+        # ── RIGHT: song detail ──────────────────────────────────────────────
+        right = tk.Frame(pane)
+        pane.add(right, minsize=500)
+
+        # Song metadata
+        meta = tk.LabelFrame(right, text="Song Info", padx=8, pady=6)
+        meta.pack(fill="x", padx=8, pady=(8, 4))
+
+        tk.Label(meta, text="Number:").grid(row=0, column=0, sticky="w")
+        self._num_var = tk.StringVar()
+        tk.Entry(meta, textvariable=self._num_var, width=10).grid(row=0, column=1, sticky="w", padx=(4, 20))
+
+        tk.Label(meta, text="Title:").grid(row=0, column=2, sticky="w")
+        self._title_var = tk.StringVar()
+        tk.Entry(meta, textvariable=self._title_var, width=40).grid(row=0, column=3, sticky="w", padx=4)
+
+        tk.Label(meta, text="Refrain:").grid(row=1, column=0, sticky="nw", pady=(6, 0))
+        self._refrain_text = tk.Text(meta, height=2, width=60, wrap="word")
+        self._refrain_text.grid(row=1, column=1, columnspan=3, sticky="ew", padx=4, pady=(6, 0))
+
+        tk.Button(meta, text="Apply Song Info", command=self._apply_song_info,
+                  bg="#1565c0", fg="white").grid(row=2, column=3, sticky="e", pady=(6, 0))
 
         # Verses
-        tk.Label(right_frame, text="Verses:").pack(anchor="w")
-        self.verse_listbox = tk.Listbox(right_frame, height=10)
-        self.verse_listbox.pack(fill=tk.BOTH, expand=True)
-        self.verse_listbox.bind("<<ListboxSelect>>", self.on_verse_select)
+        verse_area = tk.LabelFrame(right, text="Verses", padx=8, pady=6)
+        verse_area.pack(fill="both", expand=True, padx=8, pady=4)
 
-        self.verse_number_var = tk.StringVar()
-        self.verse_number_entry = tk.Entry(right_frame, textvariable=self.verse_number_var, width=5)
-        self.verse_number_entry.pack(anchor="w", pady=(2,0))
-        tk.Label(right_frame, text="Edit verse number above").pack(anchor="w")
-        self.verse_number_var.trace_add("write", lambda *args: self.update_verse_number())
+        # Left: verse list
+        vlist_frame = tk.Frame(verse_area, width=280)
+        vlist_frame.pack(side="left", fill="y")
+        vlist_frame.pack_propagate(False)
 
-        self.verse_text = tk.Text(right_frame, height=3)
-        self.verse_text.pack(fill=tk.X)
-        self.verse_text.bind("<KeyRelease>", lambda e: self.update_verse_text())
+        tk.Label(vlist_frame, text="Verse list:").pack(anchor="w")
+        self._verse_list = tk.Listbox(vlist_frame, activestyle="dotbox",
+                                      selectbackground="#1565c0", selectforeground="white")
+        vsb = tk.Scrollbar(vlist_frame, command=self._verse_list.yview)
+        self._verse_list.config(yscrollcommand=vsb.set)
+        self._verse_list.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="left", fill="y")
+        self._verse_list.bind("<<ListboxSelect>>", self._on_verse_select)
 
-        # Verse buttons
-        verse_btn_frame = tk.Frame(right_frame)
-        verse_btn_frame.pack(fill=tk.X)
-        tk.Button(verse_btn_frame, text="Add", command=self.add_verse).pack(side=tk.LEFT)
-        tk.Button(verse_btn_frame, text="Update", command=self.update_verse).pack(side=tk.LEFT)
-        tk.Button(verse_btn_frame, text="Delete", command=self.delete_verse).pack(side=tk.LEFT)
+        vlist_btns = tk.Frame(vlist_frame)
+        vlist_btns.pack(fill="x", pady=(4, 0))
+        tk.Button(vlist_btns, text="＋ Add Verse", command=self._add_verse,
+                  bg="#1565c0", fg="white").pack(side="left")
+        tk.Button(vlist_btns, text="✕ Delete", command=self._delete_verse,
+                  fg="red").pack(side="left", padx=4)
+
+        # Right: verse editor
+        vedit_frame = tk.Frame(verse_area)
+        vedit_frame.pack(side="left", fill="both", expand=True, padx=(12, 0))
+
+        tk.Label(vedit_frame, text="Verse number:").pack(anchor="w")
+        self._verse_num_var = tk.StringVar()
+        tk.Entry(vedit_frame, textvariable=self._verse_num_var, width=6).pack(anchor="w")
+
+        tk.Label(vedit_frame, text="Verse text:").pack(anchor="w", pady=(8, 0))
+        self._verse_text = tk.Text(vedit_frame, wrap="word", height=6)
+        self._verse_text.pack(fill="both", expand=True)
+
+        tk.Button(vedit_frame, text="✔ Update Verse", command=self._update_verse,
+                  bg="#1565c0", fg="white", pady=4).pack(anchor="e", pady=(6, 0))
 
         # Copyright
-        tk.Label(right_frame, text="Copyright:").pack(anchor="w")
-        self.copyright_listbox = tk.Listbox(right_frame, height=4)
-        self.copyright_listbox.pack(fill=tk.X)
+        copy_area = tk.LabelFrame(right, text="Copyright", padx=8, pady=6)
+        copy_area.pack(fill="x", padx=8, pady=(4, 8))
 
-        cr_btn_frame = tk.Frame(right_frame)
-        cr_btn_frame.pack(fill=tk.X)
-        tk.Button(cr_btn_frame, text="Add", command=self.add_copyright).pack(side=tk.LEFT)
-        tk.Button(cr_btn_frame, text="Delete", command=self.delete_copyright).pack(side=tk.LEFT)
+        self._copyright_list = tk.Listbox(copy_area, height=3)
+        self._copyright_list.pack(fill="x")
 
-    # -----------------------------
-    # --- UI Refresh Methods ------
-    # -----------------------------
-    def refresh_song_list(self):
-        self.song_listbox.delete(0, tk.END)
-        filter_text = self.search_var.get().lower()
-        for num, song in self.manager.get_sorted_songs():
-            if filter_text in num.lower() or filter_text in (song.get("title") or "").lower():
-                self.song_listbox.insert(tk.END, f"{num}: {song.get('title')}")
+        copy_btns = tk.Frame(copy_area)
+        copy_btns.pack(fill="x", pady=(4, 0))
+        tk.Button(copy_btns, text="＋ Add", command=self._add_copyright).pack(side="left")
+        tk.Button(copy_btns, text="✕ Delete", command=self._delete_copyright, fg="red").pack(side="left", padx=4)
 
-    def refresh_verse_list(self):
-        self.verse_listbox.delete(0, tk.END)
-        self.current_verse_map.clear()
-        if selected := self.song_listbox.get(tk.ACTIVE):
-            num = selected.split(":")[0]
-            for idx, v in enumerate(self.manager.songs[num]["verses"]):
-                self.verse_listbox.insert(tk.END, f"{v['verse']}: {v['text'][:40]}...")
-                self.current_verse_map.append(idx)
+    # -----------------------------------------------------------------------
+    # Song list
+    # -----------------------------------------------------------------------
 
-    def refresh_copyright(self):
-        self.copyright_listbox.delete(0, tk.END)
-        if selected := self.song_listbox.get(tk.ACTIVE):
-            num = selected.split(":")[0]
-            for c in self.manager.songs[num]["copyright"]:
-                self.copyright_listbox.insert(tk.END, c)
+    def _populate_song_list(self, reselect=None):
+        q = self._search_var.get().lower()
+        self._song_list.delete(0, tk.END)
+        self._filtered = []
 
-    # -----------------------------
-    # --- Selection Handlers ------
-    # -----------------------------
-    def on_song_select(self, evt):
-        if not self.song_listbox.curselection():
+        for num in sorted(self.songs.keys(), key=sort_key):
+            song = self.songs[num]
+            if q and q not in num.lower() and q not in (song.get("title") or "").lower():
+                continue
+            label = f"{num:>5}  {song.get('title', '')}"
+            self._song_list.insert(tk.END, label)
+            self._filtered.append(num)
+
+        # Re-select
+        target = reselect or self._current_num
+        if target and target in self._filtered:
+            idx = self._filtered.index(target)
+            self._song_list.selection_set(idx)
+            self._song_list.see(idx)
+
+    def _on_song_select(self, _evt):
+        sel = self._song_list.curselection()
+        if not sel:
             return
-        idx = self.song_listbox.curselection()[0]
-        num = self.manager.get_sorted_songs()[idx][0]
-        song = self.manager.songs[num]
-        self.title_var.set(song.get("title") or "")
-        self.refrain_text.delete("1.0", tk.END)
-        self.refrain_text.insert(tk.END, song.get("refrain") or "")
-        self.refresh_verse_list()
-        self.refresh_copyright()
+        num = self._filtered[sel[0]]
+        self._load_song(num)
 
-    def on_verse_select(self, evt):
-        if not self.verse_listbox.curselection():
+    def _load_song(self, num):
+        self._current_num = num
+        self._current_verse_idx = None
+        song = self.songs[num]
+
+        self._num_var.set(str(song.get("number", num)))
+        self._title_var.set(song.get("title", ""))
+
+        self._refrain_text.delete("1.0", tk.END)
+        self._refrain_text.insert(tk.END, song.get("refrain") or "")
+
+        self._populate_verse_list()
+        self._populate_copyright()
+        self._clear_verse_editor()
+
+    def _clear_verse_editor(self):
+        self._verse_num_var.set("")
+        self._verse_text.delete("1.0", tk.END)
+
+    # -----------------------------------------------------------------------
+    # Verse list
+    # -----------------------------------------------------------------------
+
+    def _populate_verse_list(self, reselect=None):
+        self._verse_list.delete(0, tk.END)
+        if not self._current_num:
             return
-        idx = self.verse_listbox.curselection()[0]
-        verse_idx = self.current_verse_map[idx]
-        song_num = self.song_listbox.get(tk.ACTIVE).split(":")[0]
-        verse = self.manager.songs[song_num]["verses"][verse_idx]
-        self.verse_text.delete("1.0", tk.END)
-        self.verse_text.insert(tk.END, verse["text"])
-        self.verse_number_var.set(str(verse["verse"]))
+        for v in self.songs[self._current_num].get("verses", []):
+            self._verse_list.insert(tk.END, f"v{v['verse']}  {v['text'][:30]}{'…' if len(v['text']) > 30 else ''}")
 
-    # -----------------------------
-    # --- Update Handlers ---------
-    # -----------------------------
-    def update_title(self):
-        if selected := self.song_listbox.get(tk.ACTIVE):
-            num = selected.split(":")[0]
-            self.manager.songs[num]["title"] = self.title_var.get()
-            self.refresh_song_list()
+        if reselect is not None and reselect < self._verse_list.size():
+            self._verse_list.selection_set(reselect)
+            self._verse_list.see(reselect)
+            self._current_verse_idx = reselect
+            self._load_verse(reselect)
 
-    def update_refrain(self):
-        if selected := self.song_listbox.get(tk.ACTIVE):
-            num = selected.split(":")[0]
-            self.manager.songs[num]["refrain"] = self.refrain_text.get("1.0", tk.END).strip() or None
+    def _on_verse_select(self, _evt):
+        sel = self._verse_list.curselection()
+        if not sel:
+            return
+        self._current_verse_idx = sel[0]
+        self._load_verse(sel[0])
 
-    def update_verse_text(self):
-        if selected := self.song_listbox.get(tk.ACTIVE):
-            if self.verse_listbox.curselection():
-                num = selected.split(":")[0]
-                idx = self.verse_listbox.curselection()[0]
-                verse_idx = self.current_verse_map[idx]
-                self.manager.update_verse(num, verse_idx, text=self.verse_text.get("1.0", tk.END).strip())
-                self.refresh_verse_list()
-                self.verse_listbox.selection_set(idx)
+    def _load_verse(self, idx):
+        verse = self.songs[self._current_num]["verses"][idx]
+        self._verse_num_var.set(str(verse["verse"]))
+        self._verse_text.delete("1.0", tk.END)
+        self._verse_text.insert(tk.END, verse["text"])
 
-    def update_verse_number(self):
-        if selected := self.song_listbox.get(tk.ACTIVE):
-            if self.verse_listbox.curselection():
-                num = selected.split(":")[0]
-                idx = self.verse_listbox.curselection()[0]
-                verse_idx = self.current_verse_map[idx]
-                try:
-                    new_num = int(self.verse_number_var.get())
-                    self.manager.update_verse(num, verse_idx, verse_number=new_num)
-                    self.refresh_verse_list()
-                    # re-select updated verse
-                    for new_idx, v_idx in enumerate(self.current_verse_map):
-                        if self.manager.songs[num]["verses"][v_idx]["text"] == self.verse_text.get("1.0", tk.END).strip():
-                            self.verse_listbox.selection_set(new_idx)
-                            break
-                except ValueError:
-                    pass
+    # -----------------------------------------------------------------------
+    # Copyright
+    # -----------------------------------------------------------------------
 
-    # -----------------------------
-    # --- Song CRUD ---------------
-    # -----------------------------
-    def add_song(self):
-        new_num = simpledialog.askstring("New Song", "Enter song number:")
-        if new_num:
-            self.manager.add_song(new_num)
-            self.refresh_song_list()
-            # auto-select
-            for idx, item in enumerate(self.song_listbox.get(0, tk.END)):
-                if item.startswith(new_num + ":"):
-                    self.song_listbox.selection_clear(0, tk.END)
-                    self.song_listbox.selection_set(idx)
-                    self.song_listbox.activate(idx)
-                    self.on_song_select(None)
-                    break
+    def _populate_copyright(self):
+        self._copyright_list.delete(0, tk.END)
+        if not self._current_num:
+            return
+        for c in (self.songs[self._current_num].get("copyright") or []):
+            self._copyright_list.insert(tk.END, c)
 
-    def delete_song(self):
-        if selected := self.song_listbox.get(tk.ACTIVE):
-            num = selected.split(":")[0]
-            self.manager.delete_song(num)
-            self.refresh_song_list()
+    # -----------------------------------------------------------------------
+    # Apply / Update actions
+    # -----------------------------------------------------------------------
 
-    # -----------------------------
-    # --- Verse CRUD --------------
-    # -----------------------------
-    def add_verse(self):
-        if selected := self.song_listbox.get(tk.ACTIVE):
-            num = selected.split(":")[0]
-            idx = self.manager.add_verse(num)
-            self.refresh_verse_list()
-            self.verse_listbox.selection_clear(0, tk.END)
-            self.verse_listbox.selection_set(idx)
-            self.verse_listbox.activate(idx)
-            self.on_verse_select(None)
+    def _apply_song_info(self):
+        if not self._current_num:
+            return
+        song = self.songs[self._current_num]
+        new_num   = self._num_var.get().strip()
+        new_title = self._title_var.get().strip()
+        new_refrain = self._refrain_text.get("1.0", tk.END).strip() or None
 
-    def update_verse(self):
-        self.update_verse_text()
-        self.update_verse_number()
+        if not new_num:
+            messagebox.showerror("Error", "Song number cannot be empty.", parent=self.win)
+            return
 
-    def delete_verse(self):
-        if selected := self.song_listbox.get(tk.ACTIVE):
-            if self.verse_listbox.curselection():
-                num = selected.split(":")[0]
-                idx = self.verse_listbox.curselection()[0]
-                verse_idx = self.current_verse_map[idx]
-                self.manager.delete_verse(num, verse_idx)
-                self.refresh_verse_list()
+        # Handle number change — rename key
+        if new_num != self._current_num:
+            if new_num in self.songs:
+                messagebox.showerror("Error", f"Song #{new_num} already exists.", parent=self.win)
+                return
+            self.songs[new_num] = self.songs.pop(self._current_num)
+            self._current_num = new_num
 
-    # -----------------------------
-    # --- Copyright CRUD ----------
-    # -----------------------------
-    def add_copyright(self):
-        if selected := self.song_listbox.get(tk.ACTIVE):
-            num = selected.split(":")[0]
-            new_text = simpledialog.askstring("New Copyright", "Enter copyright text:")
-            if new_text:
-                self.manager.add_copyright(num, new_text)
-                self.refresh_copyright()
+        song = self.songs[self._current_num]
+        song["number"] = new_num
+        song["title"]  = new_title
+        song["refrain"] = new_refrain
 
-    def delete_copyright(self):
-        if selected := self.song_listbox.get(tk.ACTIVE):
-            if self.copyright_listbox.curselection():
-                num = selected.split(":")[0]
-                idx = self.copyright_listbox.curselection()[0]
-                self.manager.delete_copyright(num, idx)
-                self.refresh_copyright()
+        self._dirty = True
+        self._set_status("Song info updated.")
+        self._populate_song_list(reselect=self._current_num)
 
-    # -----------------------------
-    # --- Save -------------------
-    # -----------------------------
-    def save_songs(self):
-        popup = tk.Toplevel(self.root)
-        popup.title("Confirm Save")
-        popup.geometry("1000x700")
-        tk.Label(popup, text="Confirm the data to save:").pack(anchor="w")
-        text_widget = tk.Text(popup)
-        text_widget.pack(fill=tk.BOTH, expand=True)
-        text_widget.insert(tk.END, json.dumps(self.manager.songs, indent=4))
-        text_widget.config(state=tk.DISABLED)
+    def _update_verse(self):
+        if self._current_num is None or self._current_verse_idx is None:
+            messagebox.showinfo("No verse selected", "Select a verse from the list first.", parent=self.win)
+            return
 
-        def confirm_save():
-            self.manager.save_songs()
-            messagebox.showinfo("Saved", f"Songs saved to {self.manager.json_path}")
-            popup.destroy()
+        try:
+            new_vnum = int(self._verse_num_var.get().strip())
+        except ValueError:
+            messagebox.showerror("Error", "Verse number must be an integer.", parent=self.win)
+            return
 
-        def cancel_save():
-            popup.destroy()
+        new_text = self._verse_text.get("1.0", tk.END).strip()
+        verse = self.songs[self._current_num]["verses"][self._current_verse_idx]
+        verse["verse"] = new_vnum
+        verse["text"]  = new_text
 
-        btn_frame = tk.Frame(popup)
-        btn_frame.pack(fill=tk.X)
-        tk.Button(btn_frame, text="Confirm Save", command=confirm_save).pack(side=tk.LEFT)
-        tk.Button(btn_frame, text="Cancel", command=cancel_save).pack(side=tk.LEFT)
+        # Keep verses sorted by number
+        self.songs[self._current_num]["verses"].sort(key=lambda v: v["verse"])
+
+        # Find new position of the updated verse after sort
+        new_idx = next(
+            (i for i, v in enumerate(self.songs[self._current_num]["verses"]) if v["verse"] == new_vnum),
+            self._current_verse_idx
+        )
+
+        self._dirty = True
+        self._set_status(f"Verse {new_vnum} updated.")
+        self._populate_verse_list(reselect=new_idx)
+
+    # -----------------------------------------------------------------------
+    # Song CRUD
+    # -----------------------------------------------------------------------
+
+    def _new_song(self):
+        num = simpledialog.askstring("New Song", "Enter song number (e.g. 27B):", parent=self.win)
+        if not num:
+            return
+        num = num.strip()
+        if num in self.songs:
+            messagebox.showerror("Error", f"Song #{num} already exists.", parent=self.win)
+            return
+        self.songs[num] = {"number": num, "title": "New Song", "verses": [], "refrain": None, "copyright": []}
+        self._dirty = True
+        self._populate_song_list(reselect=num)
+        self._load_song(num)
+        self._set_status(f"Created song #{num}.")
+
+    def _delete_song(self):
+        if not self._current_num:
+            return
+        if not messagebox.askyesno("Delete", f"Delete song #{self._current_num}?", parent=self.win):
+            return
+        del self.songs[self._current_num]
+        self._current_num = None
+        self._dirty = True
+        self._populate_song_list()
+        self._clear_verse_editor()
+        self._verse_list.delete(0, tk.END)
+        self._copyright_list.delete(0, tk.END)
+        self._num_var.set("")
+        self._title_var.set("")
+        self._refrain_text.delete("1.0", tk.END)
+        self._set_status("Song deleted.")
+
+    # -----------------------------------------------------------------------
+    # Verse CRUD
+    # -----------------------------------------------------------------------
+
+    def _add_verse(self):
+        if not self._current_num:
+            return
+        verses = self.songs[self._current_num]["verses"]
+        next_num = max((v["verse"] for v in verses), default=0) + 1
+        verses.append({"verse": next_num, "text": ""})
+        self._dirty = True
+        new_idx = len(verses) - 1
+        self._populate_verse_list(reselect=new_idx)
+        self._set_status(f"Added verse {next_num}.")
+
+    def _delete_verse(self):
+        if self._current_num is None or self._current_verse_idx is None:
+            return
+        verses = self.songs[self._current_num]["verses"]
+        v_num = verses[self._current_verse_idx]["verse"]
+        if not messagebox.askyesno("Delete", f"Delete verse {v_num}?", parent=self.win):
+            return
+        verses.pop(self._current_verse_idx)
+        self._current_verse_idx = None
+        self._dirty = True
+        self._populate_verse_list()
+        self._clear_verse_editor()
+        self._set_status(f"Verse {v_num} deleted.")
+
+    # -----------------------------------------------------------------------
+    # Copyright CRUD
+    # -----------------------------------------------------------------------
+
+    def _add_copyright(self):
+        if not self._current_num:
+            return
+        text = simpledialog.askstring("Copyright", "Enter copyright line:", parent=self.win)
+        if text:
+            self.songs[self._current_num].setdefault("copyright", []).append(text.strip())
+            self._dirty = True
+            self._populate_copyright()
+            self._set_status("Copyright added.")
+
+    def _delete_copyright(self):
+        if not self._current_num:
+            return
+        sel = self._copyright_list.curselection()
+        if not sel:
+            return
+        self.songs[self._current_num]["copyright"].pop(sel[0])
+        self._dirty = True
+        self._populate_copyright()
+        self._set_status("Copyright deleted.")
+
+    # -----------------------------------------------------------------------
+    # Save
+    # -----------------------------------------------------------------------
+
+    def _save_all(self):
+        count = len(self.songs)
+        if not messagebox.askyesno("Save", f"Save all {count} songs to disk?", parent=self.win):
+            return
+        try:
+            save_songs(self.songs)
+            self._dirty = False
+            self._set_status(f"✔ Saved {count} songs.")
+        except Exception as e:
+            messagebox.showerror("Save Error", str(e), parent=self.win)
+
+    # -----------------------------------------------------------------------
+    # Helpers
+    # -----------------------------------------------------------------------
+
+    def _set_status(self, msg):
+        self._status_var.set(msg)
+        self.win.after(4000, lambda: self._status_var.set(""))
